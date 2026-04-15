@@ -13,14 +13,20 @@ import { WalletAppError, signXdr } from "@/lib/wallet";
 
 const server = new rpc.Server(SOROBAN_RPC_URL);
 
-export type TxState = "idle" | "pending" | "success" | "failed";
+export type TxState = "idle" | "pending" | "success" | "error";
 
 export type CampaignState = {
-  goal: string;
-  raised: string;
-  donorCount: number;
-  owner?: string;
+  goal: number;
+  raised: number;
+  donors: number;
 };
+
+/** RPC v15 parses `contractId` as a `Contract` instance; `.slice` only exists on strings. */
+export function contractIdToString(contractId: unknown): string {
+  if (contractId == null) return "";
+  if (typeof contractId === "string") return contractId;
+  return String(contractId);
+}
 
 function requireContractId() {
   if (!CONTRACT_ID) {
@@ -47,18 +53,17 @@ export async function readCampaign(sourcePublicKey: string): Promise<CampaignSta
 
   const value = sim.result?.retval ? scValToNative(sim.result.retval) : null;
   if (!value || typeof value !== "object") {
-    return { goal: "0", raised: "0", donorCount: 0 };
+    return { goal: 0, raised: 0, donors: 0 };
   }
 
   return {
-    goal: String((value as any).goal ?? 0),
-    raised: String((value as any).raised ?? 0),
-    donorCount: Number((value as any).donor_count ?? 0),
-    owner: String((value as any).owner ?? "")
+    goal: Number((value as any).goal ?? 0),
+    raised: Number((value as any).raised ?? 0),
+    donors: Number((value as any).donor_count ?? 0),
   };
 }
 
-export async function donate(publicKey: string, amount: string) {
+export async function donate(publicKey: string, amount: number) {
   requireContractId();
   const contract = new Contract(CONTRACT_ID);
   const source = await server.getAccount(publicKey);
@@ -68,7 +73,7 @@ export async function donate(publicKey: string, amount: string) {
     networkPassphrase: Networks.TESTNET
   })
     .addOperation(
-      contract.call("donate", new Address(publicKey).toScVal(), nativeToScVal(amount, { type: "i128" }))
+      contract.call("donate", new Address(publicKey).toScVal(), nativeToScVal(String(amount), { type: "i128" }))
     )
     .setTimeout(120)
     .build();
@@ -95,22 +100,43 @@ export async function donate(publicKey: string, amount: string) {
 
 export async function waitForTx(hash: string) {
   for (let i = 0; i < 20; i += 1) {
-    const tx = await server.getTransaction(hash);
-    if (tx.status === rpc.Api.GetTransactionStatus.SUCCESS) return tx;
-    if (tx.status === rpc.Api.GetTransactionStatus.FAILED) {
-      throw new Error(`Transaction failed: ${tx.resultXdr}`);
+    try {
+      const tx = await server.getTransaction(hash);
+      if (tx.status === rpc.Api.GetTransactionStatus.SUCCESS) return tx;
+      if (tx.status === rpc.Api.GetTransactionStatus.FAILED) {
+        throw new Error(`Transaction failed: ${tx.resultXdr}`);
+      }
+    } catch (e: any) {
+      const msg = String(e?.message ?? e);
+      if (/Bad union switch/i.test(msg)) {
+        throw new Error(
+          "RPC response could not be decoded (XDR mismatch). Run `npm install @stellar/stellar-sdk@latest` and restart the dev server."
+        );
+      }
+      throw e;
     }
     await new Promise((resolve) => setTimeout(resolve, 1500));
   }
   throw new Error("Transaction confirmation timeout");
 }
 
+/** Recent ledgers to scan for contract events (RPC requires startLedger >= 1). */
+const EVENT_LEDGER_WINDOW = 5000;
+
 export async function getRecentEvents() {
   requireContractId();
-  const events = await server.getEvents({
-    startLedger: 0,
-    filters: [{ type: "contract", contractIds: [CONTRACT_ID] }],
-    limit: 10
-  });
-  return events.events ?? [];
+  try {
+    const { sequence: latest } = await server.getLatestLedger();
+    const startLedger = Math.max(1, latest - EVENT_LEDGER_WINDOW);
+    const events = await server.getEvents({
+      startLedger,
+      endLedger: latest,
+      filters: [{ type: "contract", contractIds: [CONTRACT_ID] }],
+      limit: 10
+    });
+    return events.events ?? [];
+  } catch (e) {
+    console.warn("getRecentEvents:", e);
+    return [];
+  }
 }
