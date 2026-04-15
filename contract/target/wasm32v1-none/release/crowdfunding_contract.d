@@ -1,0 +1,1 @@
+/Users/jorgesoares/Desktop/stellar/stellar-yellow-belt-crowdfunding/contract/target/wasm32v1-none/release/crowdfunding_contract.wasm: /Users/jorgesoares/Desktop/stellar/stellar-yellow-belt-crowdfunding/contract/src/lib.rs
